@@ -2,7 +2,7 @@ pub mod handlers;
 pub mod models;
 pub mod state;
 
-use axum::{Router, routing::{get, post}};
+use axum::{extract::DefaultBodyLimit, Router, routing::{get, post}};
 use tower_http::cors::{CorsLayer, Any};
 use crate::server::handlers::*;
 use crate::server::state::AppState;
@@ -16,6 +16,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/upload_pc", post(handle_pc_upload))
         .route("/download", get(handle_download))
         .route("/api/status", get(get_status))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_SIZE))
         .layer(cors)
         .with_state(state)
 }

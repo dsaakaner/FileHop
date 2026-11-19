@@ -5,7 +5,6 @@ pub struct StatusResponse {
     pub status: String,
     pub code: String,
     pub local_ip: String,
-    pub clients_count: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

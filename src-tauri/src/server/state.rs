@@ -7,28 +7,48 @@ use crate::server::models::{DeviceInfo, AppSettings, PendingDownload};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 
+pub const DOWNLOAD_TOKEN_TTL_SECS: u64 = 600;
+
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub fn find_local_ip() -> String {
     match local_ip_address::list_afinet_netifas() {
         Ok(interfaces) => {
             let mut fallback_ip = String::new();
             for (name, ip) in interfaces {
                 let ip_str = ip.to_string();
-                if ip_str.starts_with("127.") || ip_str.contains(':') { continue; }
-                
-                let name_lower = name.to_lowercase();
-                if name_lower.contains("virtual") || name_lower.contains("vethernet") || 
-                   name_lower.contains("vmware") || name_lower.contains("virtualbox") || 
-                   name_lower.contains("tun") || name_lower.contains("tap") || name_lower.contains("wsl") {
+                if ip_str.starts_with("127.") || ip_str.contains(':') {
                     continue;
                 }
-                
+
+                let name_lower = name.to_lowercase();
+                if name_lower.contains("virtual")
+                    || name_lower.contains("vethernet")
+                    || name_lower.contains("vmware")
+                    || name_lower.contains("virtualbox")
+                    || name_lower.contains("tun")
+                    || name_lower.contains("tap")
+                    || name_lower.contains("wsl")
+                {
+                    continue;
+                }
+
                 if ip_str.starts_with("192.168.") || ip_str.starts_with("10.") {
                     println!("[Network] Active IP: {} ({})", ip_str, name);
                     return ip_str;
                 }
-                if fallback_ip.is_empty() { fallback_ip = ip_str; }
+                if fallback_ip.is_empty() {
+                    fallback_ip = ip_str;
+                }
             }
-            if !fallback_ip.is_empty() { return fallback_ip; }
+            if !fallback_ip.is_empty() {
+                return fallback_ip;
+            }
             "127.0.0.1".to_string()
         }
         Err(_) => "127.0.0.1".to_string(),
@@ -39,12 +59,11 @@ pub fn find_local_ip() -> String {
 pub struct AppState {
     pub app_handle: AppHandle,
     pub access_code: Arc<RwLock<String>>,
-    pub connected_clients: Arc<RwLock<usize>>,
     pub temp_dir: PathBuf,
     pub devices: Arc<RwLock<Vec<DeviceInfo>>>,
     pub settings: Arc<RwLock<AppSettings>>,
     pub pending_downloads: Arc<RwLock<Vec<PendingDownload>>>,
-    pub failed_web_attempts: Arc<RwLock<HashMap<String, (u32, u64)>>>, // IP -> (count, timestamp)
+    pub failed_web_attempts: Arc<RwLock<HashMap<String, (u32, u64)>>>,
 }
 
 impl AppState {
@@ -57,7 +76,6 @@ impl AppState {
         Self {
             app_handle,
             access_code: Arc::new(RwLock::new(code)),
-            connected_clients: Arc::new(RwLock::new(0)),
             temp_dir: dir,
             devices: Arc::new(RwLock::new(Vec::new())),
             settings: Arc::new(RwLock::new(AppSettings {
@@ -78,29 +96,89 @@ impl AppState {
         }
     }
 
-    pub async fn add_pending_download(&self, token: String, filename: String, temp_path: String, size: usize) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    pub async fn add_pending_download(
+        &self,
+        token: String,
+        filename: String,
+        temp_path: String,
+        size: usize,
+    ) {
+        let now = now_secs();
         let mut downloads = self.pending_downloads.write().await;
-        downloads.push(PendingDownload { token, filename, temp_path, size, created_at: now });
-        downloads.retain(|d| now - d.created_at < 600);
+        downloads.push(PendingDownload {
+            token,
+            filename,
+            temp_path,
+            size,
+            created_at: now,
+        });
+
+        let mut expired = Vec::new();
+        downloads.retain(|d| {
+            if now.saturating_sub(d.created_at) >= DOWNLOAD_TOKEN_TTL_SECS {
+                expired.push(d.clone());
+                false
+            } else {
+                true
+            }
+        });
+        drop(downloads);
+
+        for item in expired {
+            let _ = tokio::fs::remove_file(&item.temp_path).await;
+        }
     }
 
     pub async fn get_pending_download(&self, token: &str) -> Option<PendingDownload> {
-        let downloads = self.pending_downloads.read().await;
-        downloads.iter().find(|d| d.token == token).cloned()
+        let now = now_secs();
+        let mut downloads = self.pending_downloads.write().await;
+        let found = downloads.iter().find(|d| d.token == token).cloned();
+
+        if let Some(ref item) = found {
+            if now.saturating_sub(item.created_at) >= DOWNLOAD_TOKEN_TTL_SECS {
+                downloads.retain(|d| d.token != token);
+                drop(downloads);
+                let _ = tokio::fs::remove_file(&item.temp_path).await;
+                return None;
+            }
+        }
+
+        found
     }
 
+    pub async fn cleanup_expired_downloads(&self) {
+        let now = now_secs();
+        let mut downloads = self.pending_downloads.write().await;
+        let mut expired = Vec::new();
+        downloads.retain(|d| {
+            if now.saturating_sub(d.created_at) >= DOWNLOAD_TOKEN_TTL_SECS {
+                expired.push(d.clone());
+                false
+            } else {
+                true
+            }
+        });
+        drop(downloads);
+
+        for item in expired {
+            eprintln!("[Cleanup] Удаляем просроченный файл {}", item.temp_path);
+            let _ = tokio::fs::remove_file(&item.temp_path).await;
+        }
+    }
+
+    /// Возвращает true, если попытка разрешена. Считаются только неудачные
+    /// попытки ввода кода; максимум 5 в минуту с одного IP.
     pub async fn check_rate_limit(&self, ip: &str) -> bool {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = now_secs();
         let mut attempts = self.failed_web_attempts.write().await;
         let entry = attempts.entry(ip.to_string()).or_insert((0, now));
-        
-        if now - entry.1 > 60 {
+
+        if now.saturating_sub(entry.1) > 60 {
             entry.0 = 0;
             entry.1 = now;
         }
-        
+
         entry.0 += 1;
-        entry.0 <= 5 // Разрешаем максимум 5 попыток в минуту
+        entry.0 <= 5
     }
 }

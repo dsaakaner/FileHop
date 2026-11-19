@@ -10,11 +10,13 @@
     let qrMode = 'receive';
     let qrCode = '---';
     let qrDataUrl = '';
+    let sendUrl = '';
     let localIp = '...';
     let qrError = '';
     let devices: any[] = [];
     let updateInterval: any = null;
     let theme = 'system';
+    let settingsLoaded = false;
     let manualIp = '';
     let pendingFile: any = null;
     let saveStatus = '';
@@ -32,51 +34,69 @@
     }
 
     let saveTimeout: any;
-    $: { clearTimeout(saveTimeout); saveTimeout = setTimeout(async () => { try { await invoke('update_settings', { theme, manualIp }); } catch (e) {} }, 500); }
+    $: if (settingsLoaded) {
+        clearTimeout(saveTimeout);
+        saveTimeout = setTimeout(async () => {
+            try { await invoke('update_settings', { theme, manualIp }); }
+            catch (e) { console.error('Settings error:', e); }
+        }, 500);
+    }
 
-    // ВАЖНО: Это reactive statement - вызывается при каждом изменении theme
-    $: applyTheme(theme);
+    function isDarkTheme(t: string): boolean {
+        return t === 'dark' || (t === 'system' && !!window.matchMedia?.('(prefers-color-scheme: dark)').matches);
+    }
 
     function applyTheme(t: string) {
         const root = document.documentElement;
-        const isDark = t === 'dark' || (t === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-        if (isDark) { 
-            root.setAttribute('data-theme', 'dark'); 
+        const isDark = isDarkTheme(t);
+        if (isDark) {
+            root.setAttribute('data-theme', 'dark');
             document.body.className = 'theme-dark';
-        } else { 
-            root.setAttribute('data-theme', 'light'); 
+        } else {
+            root.setAttribute('data-theme', 'light');
             document.body.className = 'theme-light';
         }
+        if (qrDataUrl) {
+            if (qrMode === 'receive') { void generateQR(true); }
+            else if (sendUrl) { void generateSendQR(true); }
+        }
+    }
+
+    $: applyTheme(theme);
+
+    async function generateQR(force = false) {
+        if (qrCode === '---' || !localIp || localIp === '127.0.0.1') return;
+        if (!force && qrMode !== 'receive') return;
+        const isDark = isDarkTheme(theme);
+        qrDataUrl = await QRCode.toDataURL(`http://${localIp}:7431?code=${qrCode}`, { width: 220, margin: 2, color: { dark: isDark ? '#ffffff' : '#0f172a', light: isDark ? '#0f172a' : '#ffffff' }, errorCorrectionLevel: 'M' });
+        qrError = '';
+    }
+
+    async function generateSendQR(force = false) {
+        if (!sendUrl) return;
+        if (!force && qrMode !== 'send') return;
+        const isDark = isDarkTheme(theme);
+        qrDataUrl = await QRCode.toDataURL(sendUrl, { width: 220, margin: 2, color: { dark: isDark ? '#ffffff' : '#0f172a', light: isDark ? '#0f172a' : '#ffffff' }, errorCorrectionLevel: 'M' });
     }
 
     async function loadData() {
         try {
             const settings = await invoke<any>('get_settings');
-            // Загружаем настройки только при первом запуске
-            if (!theme || theme === 'system') {
+            if (!settingsLoaded) {
                 theme = settings.theme || 'system';
                 manualIp = settings.manual_ip || '';
+                settingsLoaded = true;
             }
         } catch (e) { console.error("Settings error:", e); }
-        
+
         try {
             const res = await fetch('http://127.0.0.1:7431/api/status');
             const data = await res.json();
             qrCode = data.code || '---';
             localIp = data.local_ip || '127.0.0.1';
-            if (qrCode !== '---' && localIp && localIp !== '127.0.0.1') { generateQR(); }
+            if (qrCode !== '---' && localIp && localIp !== '127.0.0.1') { void generateQR(); }
         } catch (e) { qrError = 'Сервер недоступен'; }
         try { devices = await invoke<any[]>('get_devices'); } catch (e) { console.error("Devices error:", e); }
-    }
-
-    async function generateQR() {
-        if (qrCode === '---' || !localIp || localIp === '127.0.0.1') return;
-        if (qrMode === 'send' && qrDataUrl) return;
-        const isDark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-        if (qrMode === 'receive') {
-            qrDataUrl = await QRCode.toDataURL(`http://${localIp}:7431?code=${qrCode}`, { width: 220, margin: 2, color: { dark: isDark ? '#ffffff' : '#0f172a', light: isDark ? '#0f172a' : '#ffffff' }, errorCorrectionLevel: 'M' });
-        }
-        qrError = '';
     }
 
     async function selectFileForSend(filePath?: string) {
@@ -84,16 +104,64 @@
         const targetPath = filePath || await open({ multiple: false });
         if (!targetPath) { sendStatus = ''; return; }
         try {
-            const token = await invoke('prepare_file_for_download', { filePath: targetPath });
+            const token = await invoke<string>('prepare_file_for_download', { filePath: targetPath });
             selectedFileName = targetPath.split('\\').pop() || targetPath.split('/').pop() || 'file';
-            const isDark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-            qrDataUrl = await QRCode.toDataURL(`http://${localIp}:7431/download?token=${token}`, { width: 220, margin: 2, color: { dark: isDark ? '#ffffff' : '#0f172a', light: isDark ? '#0f172a' : '#ffffff' }, errorCorrectionLevel: 'M' });
-            sendStatus = `Готово. Отсканируйте QR-код телефоном.`;
+            sendUrl = `http://${localIp}:7431/download?token=${token}`;
+            await generateSendQR();
+            sendStatus = 'Готово. Отсканируйте QR-код телефоном.';
             showToast('Файл готов к отправке', 'success');
-        } catch (err) { sendStatus = 'Ошибка: ' + err; selectedFileName = ''; qrDataUrl = ''; showToast('Ошибка подготовки файла', 'error'); }
+        } catch (err) {
+            sendStatus = 'Ошибка: ' + err;
+            selectedFileName = '';
+            sendUrl = '';
+            qrDataUrl = '';
+            showToast('Ошибка подготовки файла', 'error');
+        }
     }
 
-    function handleDrop(e: DragEvent) { e.preventDefault(); isDragging = false; if (e.dataTransfer?.files.length) { selectFileForSend(); } }
+    async function copySendLink() {
+        if (!sendUrl) return;
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(sendUrl);
+            } else {
+                const field = document.createElement('textarea');
+                field.value = sendUrl;
+                field.setAttribute('readonly', '');
+                field.style.position = 'fixed';
+                field.style.opacity = '0';
+                document.body.appendChild(field);
+                field.select();
+                const copied = document.execCommand('copy');
+                document.body.removeChild(field);
+                if (!copied) throw new Error('copy failed');
+            }
+            showToast('Ссылка скопирована', 'success');
+        } catch (e) {
+            showToast('Не удалось скопировать — выделите ссылку вручную', 'info');
+        }
+    }
+
+    async function registerDragDrop(): Promise<() => void> {
+        try {
+            const { getCurrentWebview } = await import('@tauri-apps/api/webview');
+            return await getCurrentWebview().onDragDropEvent((event) => {
+                const payload = event.payload;
+                if (payload.type === 'enter' || payload.type === 'over') {
+                    isDragging = true;
+                } else if (payload.type === 'drop') {
+                    isDragging = false;
+                    const path = payload.paths?.[0];
+                    if (path && qrMode === 'send') { void selectFileForSend(path); }
+                } else {
+                    isDragging = false;
+                }
+            });
+        } catch (e) {
+            console.error('DragDrop error:', e);
+            return () => {};
+        }
+    }
 
     async function sendFileToDevice(targetIp: string) {
         const selected = await open({ multiple: false });
@@ -106,16 +174,48 @@
         } catch (err: any) { showToast('Ошибка: ' + err.message, 'error'); transferProgress.visible = false; }
     }
 
-    onMount(async () => {
-        await loadData();
-        updateInterval = setInterval(loadData, 3000);
-        const unlistenFile = await listen('file_received', (event: any) => { pendingFile = event.payload; saveStatus = ''; showToast('Получен новый файл', 'success'); });
-        const unlistenTransfer = await listen('transfer-complete', (event: any) => {
-            if (event.payload.status === 'success') { showToast(event.payload.message, 'success'); }
-            else { showToast('Ошибка: ' + event.payload.message, 'error'); }
-            transferProgress.visible = false;
+    onMount(() => {
+        let disposed = false;
+        let unlistenFile: (() => void) | undefined;
+        let unlistenTransfer: (() => void) | undefined;
+        let unlistenProgress: (() => void) | undefined;
+        let unlistenDrag: (() => void) | undefined;
+
+        const mq = window.matchMedia('(prefers-color-scheme: dark)');
+        const handleSystemTheme = () => { if (theme === 'system') applyTheme('system'); };
+        mq.addEventListener('change', handleSystemTheme);
+
+        (async () => {
+            await loadData();
+            if (disposed) return;
+            updateInterval = setInterval(loadData, 3000);
+            unlistenFile = await listen('file_received', (event: any) => {
+                pendingFile = event.payload; saveStatus = ''; showToast('Получен новый файл', 'success');
+            });
+            unlistenTransfer = await listen('transfer-complete', (event: any) => {
+                if (event.payload.status === 'success') { showToast(event.payload.message, 'success'); }
+                else { showToast('Ошибка: ' + event.payload.message, 'error'); }
+                transferProgress.visible = false;
+            });
+            unlistenProgress = await listen('transfer-progress', (event: any) => {
+                transferProgress.percent = event.payload.percent;
+            });
+        })();
+
+        registerDragDrop().then((cleanup) => {
+            if (disposed) cleanup();
+            else unlistenDrag = cleanup;
         });
-        return () => { clearInterval(updateInterval); unlistenFile(); unlistenTransfer(); };
+
+        return () => {
+            disposed = true;
+            clearInterval(updateInterval);
+            mq.removeEventListener('change', handleSystemTheme);
+            unlistenFile?.();
+            unlistenTransfer?.();
+            unlistenProgress?.();
+            unlistenDrag?.();
+        };
     });
 
     async function handleSave() {
@@ -206,13 +306,22 @@
                         <div class="info-grid"><div class="info-item"><span class="label">Код доступа</span><span class="value code">{qrCode}</span></div><details class="info-item ip-details"><summary class="label">Сетевой адрес</summary><span class="value">{localIp}:7431</span></details></div>
                     {:else}<div class="loading" in:fade><div class="spinner"></div><p>Генерация QR-кода...</p></div>{/if}
                 {:else}
-                    <div class="send-mode" class:drag-over={isDragging} on:dragover|preventDefault={() => isDragging = true} on:dragleave|preventDefault={() => isDragging = false} on:drop|preventDefault={handleDrop} in:fade={{ duration: 300 }}>
+                    <div class="send-mode" class:drag-over={isDragging} in:fade={{ duration: 300 }}>
                         {#if selectedFileName}
                             <div class="file-selected" in:fly={{ y: 10, duration: 200 }}><div class="file-icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></div><p class="file-name">{selectedFileName}</p><p class="file-hint">Отсканируйте QR-код телефоном для скачивания</p></div>
                             {#if qrDataUrl}<div class="qr-container" in:fade={{ duration: 300 }}><img src={qrDataUrl} alt="QR Code" /></div>{/if}
-                            <button class="btn-secondary" on:click={() => { selectedFileName = ''; qrDataUrl = ''; sendStatus = ''; selectFileForSend(); }}>Выбрать другой файл</button>
+                            {#if sendUrl}
+                                <div class="link-block">
+                                    <label class="label" for="sendLink">Ссылка для скачивания</label>
+                                    <div class="link-row">
+                                        <input id="sendLink" class="link-field" type="text" readonly value={sendUrl} on:focus={(event) => event.currentTarget.select()} />
+                                        <button class="btn-secondary copy-btn" on:click={copySendLink}>Копировать</button>
+                                    </div>
+                                </div>
+                            {/if}
+                            <button class="btn-secondary" on:click={() => { selectedFileName = ''; qrDataUrl = ''; sendUrl = ''; sendStatus = ''; selectFileForSend(); }}>Выбрать другой файл</button>
                         {:else}
-                            <div class="send-placeholder"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg><p class="send-hint">Выберите файл или перетащите его сюда</p></div>
+                            <div class="send-placeholder"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg><p class="send-hint">Выберите файл или перетащите его в окно</p></div>
                             {#if sendStatus && sendStatus.includes('Подготовка')}<div class="loading"><div class="spinner"></div><p>{sendStatus}</p></div>
                             {:else}<button class="btn-primary large" on:click={() => selectFileForSend()}><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Выбрать файл</button>{/if}
                         {/if}
@@ -223,8 +332,8 @@
         {:else if activeTab === 'settings'}
             <div class="panel" in:fade={{ duration: 200 }}>
                 <h2>Настройки приложения</h2>
-                <div class="form-group"><label>Тема оформления</label><select bind:value={theme} class="input-field"><option value="system">Системная</option><option value="light">Светлая</option><option value="dark">Темная</option></select></div>
-                <div class="form-group"><label>Ручной IP-адрес</label><input type="text" bind:value={manualIp} placeholder="192.168.1.100" class="input-field" /><span class="hint">Оставьте пустым для автоопределения (исключает VPN/WSL)</span></div>
+                <div class="form-group"><label for="themeSelect">Тема оформления</label><select id="themeSelect" bind:value={theme} class="input-field"><option value="system">Системная</option><option value="light">Светлая</option><option value="dark">Темная</option></select></div>
+                <div class="form-group"><label for="manualIp">Ручной IP-адрес</label><input id="manualIp" type="text" bind:value={manualIp} placeholder="192.168.1.100" class="input-field" /><span class="hint">Оставьте пустым для автоопределения (исключает VPN/WSL)</span></div>
                 <p class="auto-save-hint"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>Настройки сохраняются автоматически</p>
             </div>
         {/if}
@@ -289,6 +398,10 @@
     .file-name { font-size: 1.1rem; font-weight: 600; color: var(--text-main); margin: 0; word-break: break-all; }
     .file-hint { color: var(--text-muted); font-size: 0.875rem; margin: 0; }
     .status-message { margin-top: 1rem; color: var(--primary); font-weight: 500; }
+    .link-block { width: 100%; margin: 1.5rem 0 1rem; text-align: left; }
+    .link-row { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+    .link-field { flex: 1; min-width: 0; padding: 0.6rem 0.75rem; background: var(--bg-app); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-main); font-size: 0.8rem; font-family: var(--font-mono); box-sizing: border-box; }
+    .copy-btn { padding: 0.6rem 1rem; white-space: nowrap; }
     .device-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.75rem; }
     .device-item { display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.25rem; background: var(--bg-app); border: 1px solid var(--border-color); border-radius: 8px; transition: all 0.2s ease; }
     .device-item:hover { border-color: var(--primary); box-shadow: var(--shadow-sm); }
