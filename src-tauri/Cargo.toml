@@ -1,6 +1,6 @@
-[package]
+﻿[package]
 name = "filehop-temp"
-version = "0.1.1"
+version = "0.1.2"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2024"
@@ -37,6 +37,7 @@ lto = "thin"
 opt-level = 3
 panic = "abort"
 strip = true
+
 
 
 

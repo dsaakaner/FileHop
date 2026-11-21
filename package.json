@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "filehop-temp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "",
   "type": "module",
   "scripts": {
@@ -30,4 +30,5 @@
     "vite": "^8.0.16"
   }
 }
+
 
