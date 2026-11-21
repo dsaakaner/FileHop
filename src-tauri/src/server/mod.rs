@@ -1,15 +1,17 @@
+pub mod filename;
 pub mod handlers;
 pub mod models;
 pub mod state;
 
-use axum::{extract::DefaultBodyLimit, Router, routing::{get, post}};
-use tower_http::cors::{CorsLayer, Any};
 use crate::server::handlers::*;
 use crate::server::state::AppState;
+use axum::{
+    Router,
+    extract::DefaultBodyLimit,
+    routing::{get, post},
+};
 
 pub fn create_router(state: AppState) -> Router {
-    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
-
     Router::new()
         .route("/", get(serve_mobile_page))
         .route("/upload", post(handle_upload))
@@ -17,6 +19,5 @@ pub fn create_router(state: AppState) -> Router {
         .route("/download", get(handle_download))
         .route("/api/status", get(get_status))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_SIZE))
-        .layer(cors)
         .with_state(state)
 }

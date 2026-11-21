@@ -1,18 +1,22 @@
-use axum::{
-    extract::{multipart::Field, multipart::MultipartError, ConnectInfo, Query, State, Multipart},
-    http::{header, StatusCode},
-    response::{Html, Response},
-    body::Body,
-    Json,
+use crate::server::{
+    filename::{content_disposition_attachment, sanitize_filename_component},
+    models::*,
+    state::{AppState, MAX_PC_UPLOAD_SIZE, PC_UPLOAD_CONFIRM_TIMEOUT_SECS},
 };
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
-use tokio_util::io::ReaderStream;
-use crate::server::{models::*, state::AppState};
-use tauri::Emitter;
+use axum::{
+    Json,
+    body::Body,
+    extract::{ConnectInfo, Multipart, Query, State, multipart::Field, multipart::MultipartError},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use tauri::Emitter;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 
 /// Лимит тела запроса. Потоковая запись позволяет держать это ограничение
 /// на уровне 4 ГиБ без загрузки всего файла в память.
@@ -28,29 +32,10 @@ fn multipart_error(err: MultipartError) -> (StatusCode, String) {
             MAX_UPLOAD_SIZE / 1024 / 1024
         )
     } else {
-        err.body_text()
+        "Ошибка при передаче файла".to_string()
     };
-    eprintln!("[Upload] Ошибка multipart ({}): {} | {}", status, err, message);
+    eprintln!("[Upload] Ошибка multipart ({}): {}", status, err);
     (status, message)
-}
-
-fn sanitize_filename(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ' ' | '(' | ')' | '[' | ']') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let cleaned = cleaned.trim_matches(|c| c == '.' || c == ' ').to_string();
-    if cleaned.is_empty() {
-        "unknown_file".to_string()
-    } else {
-        cleaned
-    }
 }
 
 /// Читает поле multipart кусками и сразу пишет их на диск.
@@ -59,18 +44,19 @@ async fn save_file_field(
     state: &AppState,
     mut field: Field<'_>,
     prefix: &str,
+    max_size: usize,
 ) -> Result<(String, PathBuf, usize), (StatusCode, String)> {
     let original_name = field.file_name().unwrap_or("unknown_file").to_string();
-    let filename = sanitize_filename(&original_name);
+    let filename = sanitize_filename_component(&original_name);
     let token = format!("{:016x}", rand::random::<u64>());
     let mut temp_path = state.temp_dir.clone();
     temp_path.push(format!("{}_{}_{}", prefix, token, filename));
 
     let mut file = File::create(&temp_path).await.map_err(|e| {
-        eprintln!("[Upload] Не удалось создать {}: {}", temp_path.display(), e);
+        eprintln!("[Upload] Не удалось создать файл: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Ошибка создания файла: {}", e),
+            "Ошибка создания файла".to_string(),
         )
     })?;
 
@@ -85,25 +71,36 @@ async fn save_file_field(
                 return Err(multipart_error(err));
             }
         };
+        written += chunk.len();
+        if written > max_size {
+            drop(file);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "Файл слишком большой. Максимальный размер: {} МБ.",
+                    max_size / 1024 / 1024
+                ),
+            ));
+        }
         if let Err(e) = file.write_all(&chunk).await {
             drop(file);
             let _ = tokio::fs::remove_file(&temp_path).await;
-            eprintln!("[Upload] Ошибка записи {}: {}", temp_path.display(), e);
+            eprintln!("[Upload] Ошибка записи: {}", e);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Ошибка записи: {}", e),
+                "Ошибка записи файла".to_string(),
             ));
         }
-        written += chunk.len();
     }
 
     if let Err(e) = file.flush().await {
         drop(file);
         let _ = tokio::fs::remove_file(&temp_path).await;
-        eprintln!("[Upload] Ошибка записи {}: {}", temp_path.display(), e);
+        eprintln!("[Upload] Ошибка записи: {}", e);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Ошибка записи: {}", e),
+            "Ошибка записи файла".to_string(),
         ));
     }
 
@@ -111,12 +108,10 @@ async fn save_file_field(
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
-    let code = state.access_code.read().await.clone();
     let local_ip = state.get_active_ip().await;
 
     Json(StatusResponse {
         status: "online".to_string(),
-        code,
         local_ip,
     })
 }
@@ -131,73 +126,180 @@ pub async fn handle_download(
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let file = File::open(&download.temp_path)
+    let path = std::path::PathBuf::from(&download.source_path);
+    let meta = tokio::fs::metadata(&path)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let file = File::open(&path).await.map_err(|_| StatusCode::NOT_FOUND)?;
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
+    let size = meta.len();
+    let filename_header = content_disposition_attachment(&download.filename);
 
-    let filename_header = format!("attachment; filename=\"{}\"", download.filename);
-
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_DISPOSITION, filename_header)
+        .header(header::CONTENT_LENGTH, size.to_string())
+        .header(header::CACHE_CONTROL, "no-store")
         .body(body)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// Модель доверия: /upload_pc доступен всем устройствам локальной сети без кода.
-/// Это осознанный выбор для рабочего сценария ПК-ПК; код требуется только на /upload
-/// для загрузки с телефона. Не добавлять проверку кода без изменения протокола ПК-ПК.
+async fn drain_multipart(mut multipart: Multipart) {
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Загрузка файла с другого ПК. Требуется заголовок протокола новой версии;
+/// старые клиенты (v0.1.1 и ниже) получают явный отказ.
 pub async fn handle_pc_upload(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> UploadResult {
-    println!("[PC-to-PC] Получен файл из локальной сети от {}", addr);
-    let mut saved: Option<(String, PathBuf, usize)> = None;
+    let version = headers
+        .get("x-filehop-pc-upload")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
+    if version != "2" {
+        println!(
+            "[PC-to-PC] Отклонен устаревший или несовместимый клиент от {}",
+            addr.ip()
+        );
+        drain_multipart(multipart).await;
+        return Err((
+            StatusCode::UPGRADE_REQUIRED,
+            "Несовместимая версия FileHop. Обновите приложение на обеих компьютерах до актуальной версии и повторите отправку."
+                .to_string(),
+        ));
+    }
+
+    let sender_name = headers
+        .get("x-filehop-sender-name")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| sanitize_filename_component(s.trim()))
+        .filter(|s| !s.is_empty() && s != "unknown_file");
+    let sender_ip = addr.ip().to_string();
+
+    let mut saved: Option<(String, PathBuf, usize)> = None;
     loop {
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
             Ok(None) => break,
-            Err(err) => return Err(multipart_error(err)),
+            Err(err) => {
+                if let Some((_, path, _)) = saved {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+                return Err(multipart_error(err));
+            }
         };
         if field.name().unwrap_or("") == "file" {
-            let result = save_file_field(&state, field, "pc").await?;
-            println!("[PC-to-PC] Файл: {} ({} байт)", result.0, result.2);
-            saved = Some(result);
+            let result = save_file_field(&state, field, "pcstage", MAX_PC_UPLOAD_SIZE).await;
+            match result {
+                Ok(r) => {
+                    if let Some((_, old_path, _)) = saved.take() {
+                        let _ = tokio::fs::remove_file(old_path).await;
+                    }
+                    saved = Some(r);
+                }
+                Err(e) => {
+                    if let Some((_, path, _)) = saved {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    drain_multipart(multipart).await;
+                    return Err(e);
+                }
+            }
         }
     }
 
-    if let Some((filename, temp_path, size)) = saved {
-        let payload = FileReceivedPayload {
-            filename: filename.clone(),
-            temp_path: temp_path.to_string_lossy().to_string(),
-            size,
-        };
+    let Some((filename, temp_path, size)) = saved else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Файл не был прикреплен".to_string(),
+        ));
+    };
 
-        if state.app_handle.emit("file_received", payload).is_err() {
-            eprintln!("[PC-to-PC] Не удалось отправить событие file_received");
-        }
-        println!("[PC-to-PC] Файл получен и ждет сохранения: {}", filename);
-        return Ok((StatusCode::OK, "Файл успешно доставлен".to_string()));
+    let id = format!("{:016x}", rand::random::<u64>());
+    let request = IncomingTransferRequest {
+        id: id.clone(),
+        filename: filename.clone(),
+        size,
+        sender_ip: sender_ip.clone(),
+        sender_name,
+    };
+
+    let rx = state.register_pc_decision(id.clone()).await;
+    let emitted = if let Some(h) = &state.app_handle {
+        h.emit("pc-incoming-request", request).is_ok()
+    } else {
+        false
+    };
+    if !emitted {
+        let _ = state.resolve_pc_decision(&id, false).await;
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Не удалось показать запрос на подтверждение получателю".to_string(),
+        ));
     }
 
-    Err((
-        StatusCode::BAD_REQUEST,
-        "Файл не был прикреплен".to_string(),
-    ))
+    let accepted = match tokio::time::timeout(
+        std::time::Duration::from_secs(PC_UPLOAD_CONFIRM_TIMEOUT_SECS),
+        rx,
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            let _ = state.resolve_pc_decision(&id, false).await;
+            false
+        }
+    };
+
+    if !accepted {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Получатель отклонил передачу или время ожидания истекло".to_string(),
+        ));
+    }
+
+    let payload = FileReceivedPayload {
+        id: format!("{:016x}", rand::random::<u64>()),
+        filename: filename.clone(),
+        temp_path: temp_path.to_string_lossy().to_string(),
+        size,
+        source: "pc".to_string(),
+        sender_ip: Some(sender_ip),
+    };
+    state.enqueue_incoming(payload).await;
+    if let Some(h) = &state.app_handle {
+        let _ = h.emit("incoming-queue-updated", ());
+    }
+
+    println!("[PC-to-PC] Файл принят получателем: {}", filename);
+    Ok((StatusCode::OK, "Файл принят получателем".to_string()))
 }
 
-pub async fn serve_mobile_page() -> Html<String> {
-    Html(
-        r#"
+pub async fn serve_mobile_page() -> Response {
+    let html = r##"
     <!DOCTYPE html>
     <html>
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+        <meta http-equiv="Pragma" content="no-cache">
+        <meta http-equiv="Expires" content="0">
         <title>FileHop Web</title>
         <style>
             body { font-family: system-ui, sans-serif; text-align: center; padding: 20px; background: #f4f4f5; color: #333; }
@@ -218,7 +320,7 @@ pub async fn serve_mobile_page() -> Html<String> {
     <body>
         <h1>FileHop Web</h1>
         <div class="warning">
-            Внимание: передача идет по локальной сети (HTTP). Если браузер блокирует скачивание, нажмите "Сохранить" или "Все равно скачать".
+            Внимание: передача идет по локальной сети (HTTP). Данные и код доступа могут быть видны в сети.
         </div>
         <p>Код с компьютера:</p>
         <input type="text" maxlength="6" placeholder="000000" inputmode="numeric" id="code" />
@@ -232,6 +334,12 @@ pub async fn serve_mobile_page() -> Html<String> {
             const MAX_UPLOAD_BYTES = __MAX_UPLOAD_BYTES__;
             const urlParams = new URLSearchParams(window.location.search);
             if (urlParams.get('code')) document.getElementById('code').value = urlParams.get('code');
+
+            function setStatus(text, kind) {
+                const statusDiv = document.getElementById('status');
+                statusDiv.textContent = text || '';
+                statusDiv.className = kind || '';
+            }
 
             function checkFileSize() {
                 const file = document.getElementById('file').files[0];
@@ -247,14 +355,13 @@ pub async fn serve_mobile_page() -> Html<String> {
             function sendFile() {
                 const code = document.getElementById('code').value;
                 const fileInput = document.getElementById('file');
-                const statusDiv = document.getElementById('status');
                 const btn = document.getElementById('sendBtn');
                 const track = document.getElementById('progressTrack');
                 const fill = document.getElementById('progressFill');
-                if (!code || code.length !== 6) { statusDiv.innerHTML = '<span class="error">Введите 6-значный код!</span>'; return; }
-                if (fileInput.files.length === 0) { statusDiv.innerHTML = '<span class="error">Выберите файл!</span>'; return; }
+                if (!code || code.length !== 6) { setStatus('Введите 6-значный код!', 'error'); return; }
+                if (fileInput.files.length === 0) { setStatus('Выберите файл!', 'error'); return; }
                 btn.disabled = true;
-                statusDiv.textContent = 'Отправка... 0%';
+                setStatus('Отправка... 0%', '');
                 fill.style.width = '0%';
                 track.classList.remove('indeterminate');
                 track.style.display = 'block';
@@ -264,51 +371,87 @@ pub async fn serve_mobile_page() -> Html<String> {
                 formData.append('file', fileInput.files[0]);
                 const xhr = new XMLHttpRequest();
                 xhr.open('POST', '/upload');
+                xhr.setRequestHeader('X-Access-Code', code);
                 xhr.upload.onprogress = function (event) {
                     if (event.lengthComputable && event.total > 0) {
                         const percent = Math.min(100, Math.floor(event.loaded * 100 / event.total));
                         fill.style.width = percent + '%';
-                        statusDiv.textContent = 'Отправка... ' + percent + '%';
+                        setStatus('Отправка... ' + percent + '%', '');
                     } else {
                         track.classList.add('indeterminate');
-                        statusDiv.textContent = 'Отправка...';
+                        setStatus('Отправка...', '');
                     }
                 };
                 xhr.onload = function () {
                     track.style.display = 'none';
                     btn.disabled = false;
-                    const text = xhr.responseText || (xhr.status >= 400 ? 'Ошибка сервера' : 'Файл получен');
-                    statusDiv.innerHTML = xhr.status >= 200 && xhr.status < 300
-                        ? '<span class="success">' + text + '</span>'
-                        : '<span class="error">Ошибка: ' + text + '</span>';
-                    if (xhr.status >= 200 && xhr.status < 300) fileInput.value = '';
+                    const ok = xhr.status >= 200 && xhr.status < 300;
+                    const text = xhr.responseText || (ok ? 'Файл получен' : 'Ошибка сервера');
+                    if (ok) {
+                        setStatus(text, 'success');
+                        fileInput.value = '';
+                        document.getElementById('sizeWarning').style.display = 'none';
+                    } else {
+                        setStatus('Ошибка: ' + text, 'error');
+                    }
                 };
                 xhr.onerror = function () {
                     track.style.display = 'none';
                     btn.disabled = false;
-                    statusDiv.innerHTML = '<span class="error">Ошибка сети при отправке файла</span>';
+                    setStatus('Ошибка сети при отправке файла', 'error');
                 };
                 xhr.onabort = function () {
                     track.style.display = 'none';
                     btn.disabled = false;
-                    statusDiv.innerHTML = '<span class="error">Отправка отменена</span>';
+                    setStatus('Отправка отменена', 'error');
                 };
                 xhr.send(formData);
             }
         </script>
     </body>
     </html>
-    "#
-        .replace("__MAX_UPLOAD_BYTES__", &(MAX_UPLOAD_SIZE as u64).to_string()),
-    )
+    "##.replace("__MAX_UPLOAD_BYTES__", &(MAX_UPLOAD_SIZE as u64).to_string());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store, no-cache, must-revalidate, max-age=0")
+        .header(header::PRAGMA, "no-cache")
+        .header(header::EXPIRES, "0")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'",
+        )
+        .body(Body::from(html))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
 }
 
 pub async fn handle_upload(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> UploadResult {
-    let mut received_code = String::new();
+    let header_code = headers
+        .get("x-access-code")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let current_code = state.access_code.read().await.clone();
+    if let Some(ref provided) = header_code
+        && provided != &current_code
+    {
+        let ip = addr.ip().to_string();
+        if !state.check_rate_limit(&ip).await {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "Слишком много неверных попыток. Попробуйте позже.".to_string(),
+            ));
+        }
+        return Err((StatusCode::UNAUTHORIZED, "Неверный код!".to_string()));
+    }
+
+    let mut received_code = header_code.unwrap_or_default();
     let mut saved: Option<(String, PathBuf, usize)> = None;
 
     loop {
@@ -319,42 +462,98 @@ pub async fn handle_upload(
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "code" {
-            received_code = field.text().await.map_err(multipart_error)?;
+            let code = field
+                .text()
+                .await
+                .map_err(multipart_error)?
+                .trim()
+                .to_string();
+            if !received_code.is_empty() && received_code != code {
+                if let Some((_, path, _)) = saved {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+                let ip = addr.ip().to_string();
+                if !state.check_rate_limit(&ip).await {
+                    return Err((
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Слишком много неверных попыток. Попробуйте позже.".to_string(),
+                    ));
+                }
+                return Err((StatusCode::UNAUTHORIZED, "Неверный код!".to_string()));
+            }
+            if received_code.is_empty() {
+                if code != current_code {
+                    if let Some((_, path, _)) = saved {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    let ip = addr.ip().to_string();
+                    if !state.check_rate_limit(&ip).await {
+                        return Err((
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "Слишком много неверных попыток. Попробуйте позже.".to_string(),
+                        ));
+                    }
+                    return Err((StatusCode::UNAUTHORIZED, "Неверный код!".to_string()));
+                }
+                received_code = code;
+            }
         } else if name == "file" {
-            let result = save_file_field(&state, field, "up").await?;
-            println!("[Upload] Файл: {} ({} байт)", result.0, result.2);
-            saved = Some(result);
+            if received_code != current_code {
+                // Код не передан в заголовке и поле code ещё не встретилось — не пишем файл на диск.
+                let ip = addr.ip().to_string();
+                if !state.check_rate_limit(&ip).await {
+                    return Err((
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Слишком много неверных попыток. Попробуйте позже.".to_string(),
+                    ));
+                }
+                return Err((StatusCode::UNAUTHORIZED, "Неверный код!".to_string()));
+            }
+            let result = save_file_field(&state, field, "up", MAX_UPLOAD_SIZE).await;
+            match result {
+                Ok(r) => {
+                    if let Some((_, old_path, _)) = saved.take() {
+                        let _ = tokio::fs::remove_file(old_path).await;
+                    }
+                    println!("[Upload] Получен файл ({} байт)", r.2);
+                    saved = Some(r);
+                }
+                Err(e) => {
+                    if let Some((_, path, _)) = saved {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    return Err(e);
+                }
+            }
         }
     }
 
-    let current_code = state.access_code.read().await.clone();
     if received_code != current_code {
+        if let Some((_, path, _)) = saved {
+            let _ = tokio::fs::remove_file(path).await;
+        }
         let ip = addr.ip().to_string();
-        eprintln!("[Upload] Неверный код с {}", ip);
         if !state.check_rate_limit(&ip).await {
-            eprintln!("[Upload] Превышен лимит попыток с {}", ip);
-            if let Some((_, path, _)) = saved {
-                let _ = tokio::fs::remove_file(path).await;
-            }
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 "Слишком много неверных попыток. Попробуйте позже.".to_string(),
             ));
-        }
-        if let Some((_, path, _)) = saved {
-            let _ = tokio::fs::remove_file(path).await;
         }
         return Err((StatusCode::UNAUTHORIZED, "Неверный код!".to_string()));
     }
 
     if let Some((filename, temp_path, size)) = saved {
         let payload = FileReceivedPayload {
+            id: format!("{:016x}", rand::random::<u64>()),
             filename: filename.clone(),
             temp_path: temp_path.to_string_lossy().to_string(),
             size,
+            source: "phone".to_string(),
+            sender_ip: Some(addr.ip().to_string()),
         };
-        if state.app_handle.emit("file_received", payload).is_err() {
-            eprintln!("[Upload] Не удалось отправить событие file_received");
+        state.enqueue_incoming(payload).await;
+        if let Some(h) = &state.app_handle {
+            let _ = h.emit("incoming-queue-updated", ());
         }
         println!("[Upload] Файл получен и ждет сохранения: {}", filename);
         return Ok((StatusCode::OK, "Файл получен".to_string()));

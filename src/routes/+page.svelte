@@ -1,44 +1,63 @@
 <script lang="ts">
     import { onMount } from 'svelte';
-    import { listen } from '@tauri-apps/api/event';
+    import { listen, type UnlistenFn } from '@tauri-apps/api/event';
     import { save, open } from '@tauri-apps/plugin-dialog';
     import { invoke } from '@tauri-apps/api/core';
     import QRCode from 'qrcode';
     import { fly, fade } from 'svelte/transition';
+    import type {
+        AppSettings,
+        DeviceInfo,
+        FileReceivedPayload,
+        IncomingTransferRequest,
+        ServerStatus,
+        StatusResponse,
+        TransferCompletePayload,
+        TransferProgressPayload
+    } from '$lib/types';
 
-    let activeTab = 'devices';
-    let qrMode = 'receive';
+    let activeTab: 'devices' | 'qr' | 'settings' = 'devices';
+    let qrMode: 'receive' | 'send' = 'receive';
     let qrCode = '---';
     let qrDataUrl = '';
     let sendUrl = '';
     let localIp = '...';
     let qrError = '';
-    let devices: any[] = [];
-    let updateInterval: any = null;
-    let theme = 'system';
+    let devices: DeviceInfo[] = [];
+    let updateInterval: ReturnType<typeof setInterval> | null = null;
+    let theme: AppSettings['theme'] = 'system';
     let settingsLoaded = false;
     let manualIp = '';
-    let pendingFile: any = null;
     let saveStatus = '';
     let sendStatus = '';
     let selectedFileName = '';
     let isDragging = false;
-    let toasts: Array<{id: number, message: string, type: string}> = [];
+    let toasts: Array<{id: number, message: string, type: 'info' | 'success' | 'error'}> = [];
     let toastId = 0;
     let transferProgress: {filename: string, percent: number, visible: boolean} = {filename: '', percent: 0, visible: false};
+    let incomingQueue: FileReceivedPayload[] = [];
+    let activeIncoming: FileReceivedPayload | null = null;
+    let pcRequests: IncomingTransferRequest[] = [];
+    let settingsError = '';
 
-    function showToast(message: string, type: string = 'info') {
+    function showToast(message: string, type: 'info' | 'success' | 'error' = 'info') {
         const id = ++toastId;
         toasts = [...toasts, { id, message, type }];
         setTimeout(() => { toasts = toasts.filter(t => t.id !== id); }, 3000);
     }
 
-    let saveTimeout: any;
+    let saveTimeout: ReturnType<typeof setTimeout> | undefined;
     $: if (settingsLoaded) {
-        clearTimeout(saveTimeout);
+        if (saveTimeout) clearTimeout(saveTimeout);
         saveTimeout = setTimeout(async () => {
-            try { await invoke('update_settings', { theme, manualIp }); }
-            catch (e) { console.error('Settings error:', e); }
+            try {
+                await invoke<AppSettings>('update_settings', { theme, manualIp });
+                settingsError = '';
+            }
+            catch (e) {
+                settingsError = typeof e === 'string' ? e : String(e);
+                console.error('Settings error:', e);
+            }
         }, 500);
     }
 
@@ -81,7 +100,7 @@
 
     async function loadData() {
         try {
-            const settings = await invoke<any>('get_settings');
+            const settings = await invoke<AppSettings>('get_settings');
             if (!settingsLoaded) {
                 theme = settings.theme || 'system';
                 manualIp = settings.manual_ip || '';
@@ -89,14 +108,43 @@
             }
         } catch (e) { console.error("Settings error:", e); }
 
+        let serverOk = false;
         try {
-            const res = await fetch('http://127.0.0.1:7431/api/status');
-            const data = await res.json();
-            qrCode = data.code || '---';
-            localIp = data.local_ip || '127.0.0.1';
-            if (qrCode !== '---' && localIp && localIp !== '127.0.0.1') { void generateQR(); }
-        } catch (e) { qrError = 'Сервер недоступен'; }
-        try { devices = await invoke<any[]>('get_devices'); } catch (e) { console.error("Devices error:", e); }
+            const status = await invoke<ServerStatus>('get_server_status');
+            if (status.http_ok) {
+                serverOk = true;
+                qrError = '';
+            } else {
+                serverOk = false;
+                qrError = status.http_error || 'Сервер недоступен (порт 7431)';
+            }
+        } catch { /* status not available yet */ }
+
+        if (serverOk) {
+            try {
+                const code = await invoke<string>('get_access_code');
+                if (code) qrCode = code;
+            } catch (e) { console.error("Access code error:", e); }
+
+            try {
+                const ip = await invoke<string>('get_active_ip');
+                if (ip) localIp = ip;
+            } catch { /* ignore */ }
+
+            if ((!localIp || localIp === '...' || localIp === '127.0.0.1')) {
+                try {
+                    const res = await fetch('http://127.0.0.1:7431/api/status');
+                    const data = await res.json() as StatusResponse;
+                    if (data.local_ip) localIp = data.local_ip;
+                } catch { /* ignore */ }
+            }
+        }
+
+        if (serverOk && qrCode !== '---' && localIp && localIp !== '127.0.0.1') {
+            void generateQR();
+        }
+
+        try { devices = await invoke<DeviceInfo[]>('get_devices'); } catch (e) { console.error("Devices error:", e); }
     }
 
     async function selectFileForSend(filePath?: string) {
@@ -105,7 +153,7 @@
         if (!targetPath) { sendStatus = ''; return; }
         try {
             const token = await invoke<string>('prepare_file_for_download', { filePath: targetPath });
-            selectedFileName = targetPath.split('\\').pop() || targetPath.split('/').pop() || 'file';
+            selectedFileName = targetPath.split(/[\\/]/).pop() || 'file';
             sendUrl = `http://${localIp}:7431/download?token=${token}`;
             await generateSendQR();
             sendStatus = 'Готово. Отсканируйте QR-код телефоном.';
@@ -137,7 +185,7 @@
                 if (!copied) throw new Error('copy failed');
             }
             showToast('Ссылка скопирована', 'success');
-        } catch (e) {
+        } catch {
             showToast('Не удалось скопировать — выделите ссылку вручную', 'info');
         }
     }
@@ -166,20 +214,74 @@
     async function sendFileToDevice(targetIp: string) {
         const selected = await open({ multiple: false });
         if (!selected) { return; }
-        transferProgress = { filename: selected.split('\\').pop() || 'file', percent: 0, visible: true };
+        const name = selected.split(/[\\/]/).pop() || 'file';
+        transferProgress = { filename: name, percent: 0, visible: true };
         try {
             await invoke('send_file_to_device', { targetIp, filePath: selected });
-            showToast('Файл успешно отправлен!', 'success');
+        } catch (err: unknown) {
+            const message = typeof err === 'string' ? err : err instanceof Error ? err.message : String(err);
+            showToast('Ошибка: ' + message, 'error');
             transferProgress.visible = false;
-        } catch (err: any) { showToast('Ошибка: ' + err.message, 'error'); transferProgress.visible = false; }
+        }
+    }
+
+    async function cancelTransfer() {
+        try {
+            await invoke('cancel_send_file');
+            showToast('Запрошена отмена передачи', 'info');
+        } catch {
+            showToast('Не удалось отменить передачу', 'error');
+        }
+    }
+
+    async function refreshIncomingQueue() {
+        try {
+            incomingQueue = await invoke<FileReceivedPayload[]>('get_incoming_queue');
+            if (!activeIncoming && incomingQueue.length > 0) {
+                activeIncoming = incomingQueue[0];
+                saveStatus = '';
+            }
+            if (activeIncoming) {
+                const activeId = activeIncoming.id;
+                const stillThere = incomingQueue.find((f) => f.id === activeId);
+                if (!stillThere) {
+                    activeIncoming = incomingQueue[0] || null;
+                    saveStatus = '';
+                }
+            }
+        } catch (e) {
+            console.error('Queue error:', e);
+        }
+    }
+
+    async function respondPcRequest(id: string, accepted: boolean) {
+        try {
+            await invoke<boolean>('respond_pc_transfer', { id, accepted });
+            pcRequests = pcRequests.filter((r) => r.id !== id);
+            showToast(accepted ? 'Передача принята' : 'Передача отклонена', accepted ? 'success' : 'info');
+        } catch {
+            showToast('Не удалось отправить ответ', 'error');
+        }
+    }
+
+    async function rotateCode() {
+        try {
+            qrCode = await invoke<string>('rotate_access_code');
+            qrDataUrl = '';
+            await generateQR(true);
+            showToast('Код доступа обновлен', 'success');
+        } catch {
+            showToast('Не удалось обновить код', 'error');
+        }
     }
 
     onMount(() => {
         let disposed = false;
-        let unlistenFile: (() => void) | undefined;
-        let unlistenTransfer: (() => void) | undefined;
-        let unlistenProgress: (() => void) | undefined;
-        let unlistenDrag: (() => void) | undefined;
+        let unlistenQueue: UnlistenFn | undefined;
+        let unlistenPcReq: UnlistenFn | undefined;
+        let unlistenTransfer: UnlistenFn | undefined;
+        let unlistenProgress: UnlistenFn | undefined;
+        let unlistenDrag: UnlistenFn | undefined;
 
         const mq = window.matchMedia('(prefers-color-scheme: dark)');
         const handleSystemTheme = () => { if (theme === 'system') applyTheme('system'); };
@@ -187,17 +289,26 @@
 
         (async () => {
             await loadData();
+            await refreshIncomingQueue();
             if (disposed) return;
             updateInterval = setInterval(loadData, 3000);
-            unlistenFile = await listen('file_received', (event: any) => {
-                pendingFile = event.payload; saveStatus = ''; showToast('Получен новый файл', 'success');
+            unlistenQueue = await listen<void>('incoming-queue-updated', async () => {
+                await refreshIncomingQueue();
+                showToast('Получен новый файл', 'success');
             });
-            unlistenTransfer = await listen('transfer-complete', (event: any) => {
-                if (event.payload.status === 'success') { showToast(event.payload.message, 'success'); }
-                else { showToast('Ошибка: ' + event.payload.message, 'error'); }
+            unlistenPcReq = await listen<IncomingTransferRequest>('pc-incoming-request', (event) => {
+                pcRequests = [...pcRequests, event.payload];
+            });
+            unlistenTransfer = await listen<TransferCompletePayload>('transfer-complete', (event) => {
+                if (!transferProgress.visible) return;
+                if (event.payload.status === 'success' || event.payload.status === 'ok') {
+                    showToast(event.payload.message || 'Файл успешно отправлен!', 'success');
+                } else {
+                    showToast('Ошибка: ' + (event.payload.message || 'Неизвестная ошибка'), 'error');
+                }
                 transferProgress.visible = false;
             });
-            unlistenProgress = await listen('transfer-progress', (event: any) => {
+            unlistenProgress = await listen<TransferProgressPayload>('transfer-progress', (event) => {
                 transferProgress.percent = event.payload.percent;
             });
         })();
@@ -209,9 +320,10 @@
 
         return () => {
             disposed = true;
-            clearInterval(updateInterval);
+            if (updateInterval) clearInterval(updateInterval);
             mq.removeEventListener('change', handleSystemTheme);
-            unlistenFile?.();
+            unlistenQueue?.();
+            unlistenPcReq?.();
             unlistenTransfer?.();
             unlistenProgress?.();
             unlistenDrag?.();
@@ -219,18 +331,38 @@
     });
 
     async function handleSave() {
-        if (!pendingFile) return;
+        if (!activeIncoming) return;
         saveStatus = 'Открытие диалога...';
         try {
-            const filePath = await save({ defaultPath: pendingFile.filename });
+            const filePath = await save({ defaultPath: activeIncoming.filename });
             if (filePath) {
                 saveStatus = 'Сохранение...';
-                const result = await invoke<string>('save_incoming_file', { tempPath: pendingFile.temp_path, destPath: filePath });
-                saveStatus = 'Успешно сохранено';
+                await invoke<string>('save_incoming_file', { id: activeIncoming.id, destPath: filePath });
                 showToast('Файл сохранен', 'success');
-                setTimeout(() => { pendingFile = null; saveStatus = ''; }, 2000);
-            } else { saveStatus = 'Отменено'; pendingFile = null; }
-        } catch (err) { saveStatus = 'Ошибка: ' + err; }
+                await refreshIncomingQueue();
+                saveStatus = '';
+            } else {
+                await invoke<void>('discard_incoming_file', { id: activeIncoming.id });
+                saveStatus = '';
+                await refreshIncomingQueue();
+                showToast('Сохранение отменено, временный файл удалён', 'info');
+            }
+        } catch (err) {
+            saveStatus = 'Ошибка: ' + err;
+            showToast('Ошибка сохранения файла', 'error');
+        }
+    }
+
+    async function discardIncoming() {
+        if (!activeIncoming) return;
+        try {
+            await invoke('discard_incoming_file', { id: activeIncoming.id });
+            await refreshIncomingQueue();
+            saveStatus = '';
+            showToast('Входящий файл отклонён', 'info');
+        } catch (e) {
+            showToast('Не удалось отклонить файл', 'error');
+        }
     }
 </script>
 
@@ -303,7 +435,7 @@
                     {#if qrError}<div class="error-state" in:fade><p>{qrError}</p></div>
                     {:else if qrDataUrl}
                         <div class="qr-wrapper" in:fade={{ duration: 300 }}><div class="qr-container"><img src={qrDataUrl} alt="QR Code" /><div class="qr-scan-line"></div></div></div>
-                        <div class="info-grid"><div class="info-item"><span class="label">Код доступа</span><span class="value code">{qrCode}</span></div><details class="info-item ip-details"><summary class="label">Сетевой адрес</summary><span class="value">{localIp}:7431</span></details></div>
+                        <div class="info-grid"><div class="info-item"><div class="code-row"><span class="label">Код доступа</span><button class="btn-secondary small-btn" on:click={rotateCode}>Обновить код</button></div><span class="value code">{qrCode}</span></div><details class="info-item ip-details"><summary class="label">Сетевой адрес</summary><span class="value">{localIp}:7431</span></details></div>
                     {:else}<div class="loading" in:fade><div class="spinner"></div><p>Генерация QR-кода...</p></div>{/if}
                 {:else}
                     <div class="send-mode" class:drag-over={isDragging} in:fade={{ duration: 300 }}>
@@ -333,14 +465,36 @@
             <div class="panel" in:fade={{ duration: 200 }}>
                 <h2>Настройки приложения</h2>
                 <div class="form-group"><label for="themeSelect">Тема оформления</label><select id="themeSelect" bind:value={theme} class="input-field"><option value="system">Системная</option><option value="light">Светлая</option><option value="dark">Темная</option></select></div>
-                <div class="form-group"><label for="manualIp">Ручной IP-адрес</label><input id="manualIp" type="text" bind:value={manualIp} placeholder="192.168.1.100" class="input-field" /><span class="hint">Оставьте пустым для автоопределения (исключает VPN/WSL)</span></div>
+                <div class="form-group"><label for="manualIp">Ручной IP-адрес</label><input id="manualIp" type="text" bind:value={manualIp} placeholder="192.168.1.100" class="input-field" /><span class="hint">Оставьте пустым для автоопределения (исключает VPN/WSL)</span>{#if settingsError}<p class="settings-error">{settingsError}</p>{/if}</div>
                 <p class="auto-save-hint"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>Настройки сохраняются автоматически</p>
             </div>
         {/if}
     </main>
 
-    {#if pendingFile}<div class="notification" in:fly={{ y: 20, duration: 300 }}><div class="notif-header"><span class="notif-title">Получен файл</span><span class="notif-size">{(pendingFile.size / 1024 / 1024).toFixed(2)} MB</span></div><div class="notif-filename">{pendingFile.filename}</div><button class="btn-primary full-width" on:click={handleSave} disabled={saveStatus !== ''}>{saveStatus || 'Сохранить как...'}</button></div>{/if}
-    {#if transferProgress.visible}<div class="transfer-progress" in:fly={{ y: 20, duration: 300 }}><div class="progress-header"><span>Отправка: {transferProgress.filename}</span><span>{transferProgress.percent}%</span></div><div class="progress-bar"><div class="progress-fill" style="width: {transferProgress.percent}%"></div></div></div>{/if}
+    {#if activeIncoming}
+        <div class="notification" in:fly={{ y: 20, duration: 300 }}>
+            <div class="notif-header"><span class="notif-title">Входящий файл</span><span class="notif-size">{(activeIncoming.size / 1024 / 1024).toFixed(2)} MB</span></div>
+            <div class="notif-filename">{activeIncoming.filename}</div>
+            {#if activeIncoming.sender_ip}<div class="notif-meta">Источник: {activeIncoming.source === 'pc' ? 'ПК' : 'Телефон'} ({activeIncoming.sender_ip})</div>{/if}
+            {#if incomingQueue.length > 1}<div class="notif-meta">В очереди: {incomingQueue.length}</div>{/if}
+            <div class="notif-actions">
+                <button class="btn-primary full-width" on:click={handleSave} disabled={saveStatus !== ''}>{saveStatus || 'Сохранить как...'}</button>
+                <button class="btn-secondary full-width" on:click={discardIncoming} disabled={saveStatus !== ''}>Отклонить</button>
+            </div>
+        </div>
+    {/if}
+    {#each pcRequests as req (req.id)}
+        <div class="notification pc-request" in:fly={{ y: 20, duration: 300 }}>
+            <div class="notif-header"><span class="notif-title">Запрос на передачу</span><span class="notif-size">{(req.size / 1024 / 1024).toFixed(2)} MB</span></div>
+            <div class="notif-filename">{req.filename}</div>
+            <div class="notif-meta">От: {req.sender_name || 'Неизвестный ПК'} ({req.sender_ip})</div>
+            <div class="notif-actions row">
+                <button class="btn-primary" on:click={() => respondPcRequest(req.id, true)}>Принять</button>
+                <button class="btn-secondary" on:click={() => respondPcRequest(req.id, false)}>Отклонить</button>
+            </div>
+        </div>
+    {/each}
+    {#if transferProgress.visible}<div class="transfer-progress" in:fly={{ y: 20, duration: 300 }}><div class="progress-header"><span>Отправка: {transferProgress.filename}</span><span>{transferProgress.percent}%</span></div><div class="progress-bar"><div class="progress-fill" style="width: {transferProgress.percent}%"></div></div><button class="btn-secondary full-width" on:click={cancelTransfer}>Отменить передачу</button></div>{/if}
     <div class="toast-container">{#each toasts as toast (toast.id)}<div class="toast toast-{toast.type}" in:fly={{ x: 100, duration: 300 }} out:fade={{ duration: 200 }}>{#if toast.type === 'success'}<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>{:else if toast.type === 'error'}<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>{:else}<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>{/if}<span>{toast.message}</span></div>{/each}</div>
 </div>
 
@@ -429,7 +583,15 @@
     .notif-header { display: flex; justify-content: space-between; margin-bottom: 0.5rem; }
     .notif-title { font-weight: 600; }
     .notif-size { font-size: 0.85rem; color: var(--text-muted); }
-    .notif-filename { font-size: 0.9rem; color: var(--text-muted); word-break: break-all; margin-bottom: 0.75rem; }
+    .notif-filename { font-size: 0.9rem; color: var(--text-muted); word-break: break-all; margin-bottom: 0.5rem; }
+    .notif-meta { font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+    .notif-actions { display: flex; flex-direction: column; gap: 0.5rem; }
+    .notif-actions.row { flex-direction: row; }
+    .notif-actions.row button { flex: 1; }
+    .pc-request { bottom: 2rem; left: 2rem; right: auto; border-left-color: #f59e0b; }
+    .code-row { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; width: 100%; }
+    .small-btn { padding: 0.35rem 0.6rem; font-size: 0.75rem; }
+    .settings-error { margin-top: 0.5rem; color: var(--error); font-size: 0.85rem; }
     .spinner { width: 32px; height: 32px; border: 3px solid var(--border-color); border-top-color: var(--primary); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 1rem; }
     @keyframes spin { to { transform: rotate(360deg); } }
     .transfer-progress { position: fixed; bottom: 2rem; right: 2rem; width: 320px; background: var(--bg-panel); border: 1px solid var(--border-color); border-left: 4px solid var(--primary); border-radius: 12px; padding: 1.25rem; box-shadow: var(--shadow-lg); z-index: 100; }

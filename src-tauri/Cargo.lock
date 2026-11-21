@@ -928,6 +928,7 @@ dependencies = [
  "axum",
  "futures-util",
  "hostname",
+ "http-body-util",
  "local-ip-address",
  "rand",
  "reqwest 0.12.28",
@@ -938,6 +939,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http",
 ]
 
